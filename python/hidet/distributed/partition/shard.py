@@ -68,7 +68,7 @@ class TensorShardSpec:
         assert isinstance(other, TensorShardSpec)
         if self.ndim != other.ndim:
             return False
-        return self._sharded_dim == other._sharded_dim
+        return self.sharded_dim_per_axis == other.sharded_dim_per_axis
 
 
 def get_tile(
