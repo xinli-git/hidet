@@ -10,16 +10,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # pylint: disable=redefined-builtin, unnecessary-lambda
-from typing import List, Callable, Any, Union, Optional, Dict
+from typing import List, Callable, Any, Union, Optional, Dict, Sequence
 
 from hidet.ir import primitives
-from hidet.ir import expr, dtypes
+from hidet.ir import Var, expr, dtypes
 from hidet.ir.type import DataType
-from hidet.ir.expr import Expr, Var, if_then_else
+from hidet.ir.expr import Expr, if_then_else, logical_or, is_constant, is_true
 from hidet.ir.tools import rewrite
 from hidet.utils import prod, same_list
 from .utils import Task, Operator, Tensor, TensorNode, InverseMap, compute, input_like
 from .utils import broadcast_shape, broadcast_shapes, broadcast_indices
+from .utils import normalize_slice, normalize_dim
+
+PyScalar = Union[int, float, bool]
+
 
 # In order for the subgraph rewrite of Composite Elementwise Operator to work,
 # we need to store the callable in an Operator object. But lambda cannot be pickled,
@@ -117,7 +121,7 @@ class VariadicElementwiseTask(Task):
             inverse_map={
                 v: InverseMap.identity(len(v_shape))
                 for v, v_shape in zip(args, shapes)
-                if prod(v_shape) == prod(out_shape)
+                if is_true(prod(v_shape) == prod(out_shape)) and len(v_shape) == len(out_shape)
             },
         )
 
@@ -185,6 +189,78 @@ class WhereTask(Task):
         )
 
 
+class SetStridedSliceTask(Task):
+    def __init__(
+        self,
+        data: TensorNode,
+        starts: List[Optional[int]],
+        ends: List[Optional[int]],
+        axes: List[int],
+        strides: List[int],
+        setvalue: [Union[int, float]],
+    ):
+        assert len(starts) == len(ends) == len(axes) == len(strides)
+        if len(axes) != len(set(axes)):
+            raise ValueError('Duplicated axes in slice, axes: {}'.format(axes))
+        output_shape = list(data.shape)
+        axis2info = {}
+        for axis, start, end, stride in zip(axes, starts, ends, strides):
+            if stride == 0:
+                raise NotImplementedError(
+                    'Stride can not be 0 in slicing: '
+                    'starts {} ends {} axes {} strides {}.'.format(starts, ends, axes, strides)
+                )
+            if is_constant(output_shape[axis]) and output_shape[axis] < 0:
+                raise NotImplementedError(
+                    'Slice result can not be: '
+                    'starts {} ends {} axes {} strides {}'.format(starts, ends, axes, strides)
+                )
+            axis2info[axis] = (start, end, stride)
+
+        def fmap(indices):
+            ret = data.type.dtype(setvalue)
+            for axis, index in enumerate(indices):
+                start, end, stride = axis2info[axis]
+                ret = if_then_else(
+                    logical_or(index < start, index >= end, (index - start) % stride != 0), data[indices], ret
+                )
+            return ret
+
+        out = compute('out', shape=output_shape, fcompute=lambda *indices: fmap(indices))
+        super().__init__(name='set_slice', inputs=[data], outputs=[out])
+
+
+class RollTask(Task):
+    def __init__(self, x: TensorNode, shifts: Sequence[int], dims: Sequence[int]):
+        output_shape = list(x.shape)
+
+        def fmap(indices):
+            data_indices = []
+            for axis, index in enumerate(indices):
+                if axis in dims:
+                    i = dims.index(axis)
+                    if shifts[i] > 0:
+                        data_indices.append(
+                            if_then_else(
+                                index - shifts[i] >= 0, index - shifts[i], index + output_shape[axis] - shifts[i]
+                            )
+                        )
+                    else:
+                        data_indices.append(
+                            if_then_else(
+                                index - shifts[i] < output_shape[axis],
+                                index - shifts[i],
+                                index - output_shape[axis] - shifts[i],
+                            )
+                        )
+                else:
+                    data_indices.append(index)
+            return x[data_indices]
+
+        out = compute('out', shape=output_shape, fcompute=lambda *indices: fmap(indices))
+        super().__init__(name='roll', inputs=[x], outputs=[out])
+
+
 class UnaryElementwiseOp(Operator):
     def __init__(self, x: Tensor, op, name: str, attributes: Optional[Dict[str, Any]] = None, task_attributes=None):
         if attributes is None:
@@ -205,6 +281,15 @@ class BinaryElementwiseOp(Operator):
             attributes={},
             task=BinaryElementwiseTask(name, input_like(x, 'x'), input_like(y, 'y'), op=op),
         )
+
+
+def get_dtype(scalar: Expr):
+    from hidet.ir.tools import infer_type
+
+    inferred_type = infer_type(scalar)
+    if not isinstance(inferred_type, DataType):
+        raise TypeError(f'Expected scalar to be of type DataType, got {type(inferred_type)}')
+    return inferred_type
 
 
 class CompositeElementwiseOp(Operator):
@@ -238,37 +323,37 @@ def resolve_dtype(tensor_dtype: DataType, scalar_dtype: DataType) -> DataType:
 
 class AddScalarOp(UnaryElementwiseOp):
     def __init__(self, x: Tensor, scalar: Expr):
-        dtype = resolve_dtype(x.dtype, scalar.type)
+        dtype = resolve_dtype(x.dtype, get_dtype(scalar))
         super().__init__(x, op=lambda v: v + dtype(scalar), attributes={'scalar': scalar}, name='adds')
 
 
 class SubScalarOp(UnaryElementwiseOp):
     def __init__(self, x: Tensor, scalar: Expr):
-        dtype = resolve_dtype(x.dtype, scalar.type)
+        dtype = resolve_dtype(x.dtype, get_dtype(scalar))
         super().__init__(x, op=lambda v: v - dtype(scalar), attributes={'scalar': scalar}, name='subs')
 
 
 class RSubScalarOp(UnaryElementwiseOp):
     def __init__(self, x: Tensor, scalar: Expr):
-        dtype = resolve_dtype(x.dtype, scalar.type)
+        dtype = resolve_dtype(x.dtype, get_dtype(scalar))
         super().__init__(x, op=lambda v: dtype(scalar) - v, attributes={'scalar': scalar}, name='rsubs')
 
 
 class MultiplyScalarOp(UnaryElementwiseOp):
     def __init__(self, x: Tensor, scalar: Expr):
-        dtype = resolve_dtype(x.dtype, scalar.type)
+        dtype = resolve_dtype(x.dtype, get_dtype(scalar))
         super().__init__(x, op=lambda v: v * dtype(scalar), attributes={'scalar': scalar}, name='muls')
 
 
 class DivideScalarOp(UnaryElementwiseOp):
     def __init__(self, x: Tensor, scalar: Expr):
-        dtype = resolve_dtype(x.dtype, scalar.type)
+        dtype = resolve_dtype(x.dtype, get_dtype(scalar))
         super().__init__(x, op=lambda v: v / dtype(scalar), attributes={'scalar': scalar}, name='divs')
 
 
 class RDivideScalarOp(UnaryElementwiseOp):
     def __init__(self, x: Tensor, scalar: Expr):
-        dtype = resolve_dtype(x.dtype, scalar.type)
+        dtype = resolve_dtype(x.dtype, get_dtype(scalar))
         super().__init__(x, op=lambda v: dtype(scalar) / v, attributes={'scalar': scalar}, name='rdivs')
 
 
@@ -478,6 +563,19 @@ class SignOp(UnaryElementwiseOp):
         )
 
 
+class ClampOp(UnaryElementwiseOp):
+    def __init__(self, x: Tensor, min_value: Union[int, float], max_value: Union[int, float]):
+        assert isinstance(min_value, (int, float))
+        assert isinstance(max_value, (int, float))
+        min_value = x.dtype(min_value)
+        max_value = x.dtype(max_value)
+        super().__init__(
+            x,
+            op=lambda a: if_then_else(a < min_value, min_value, if_then_else(a > max_value, max_value, a)),
+            name='clamp',
+        )
+
+
 class RightShiftOp(BinaryElementwiseOp):
     def __init__(self, x: Tensor, y: Tensor):
         super().__init__(x, y, op=lambda a, b: expr.RightShift(a, b), name='rightshift')
@@ -522,6 +620,47 @@ class WhereOp(Operator):
         )
 
 
+class WhereScalarScalarOp(Operator):
+    def __init__(self, cond: Tensor, x: PyScalar, y: PyScalar):
+        if isinstance(x, int) and isinstance(y, int):
+            dtype = dtypes.default_int_dtype
+        elif isinstance(x, float) or isinstance(y, float):
+            dtype = dtypes.default_float_dtype
+        else:
+            raise ValueError(f'Unsupported scalar type: {type(x)}')
+        x, y = dtype(x), dtype(y)
+        super().__init__(
+            inputs=[cond],
+            attributes={'x': x, 'y': y},
+            task=UnaryElementwiseTask(name='where', x=input_like(cond, 'cond'), op=lambda a: if_then_else(a, x, y)),
+        )
+
+
+class WhereScalarTensorOp(Operator):
+    def __init__(self, cond: Tensor, y: Tensor, x: PyScalar):
+        dtype = y.dtype
+        x = dtype(x)
+        super().__init__(
+            inputs=[cond, y],
+            attributes={'x': x},
+            task=BinaryElementwiseTask(
+                name='where', x=input_like(cond, 'cond'), y=input_like(y, 'y'), op=lambda a, b: if_then_else(a, x, b)
+            ),
+        )
+
+
+class WhereTensorScalarOp(Operator):
+    def __init__(self, cond: Tensor, x: Tensor, y: PyScalar):
+        y = x.dtype(y)
+        super().__init__(
+            inputs=[cond, x],
+            attributes={'y': y},
+            task=BinaryElementwiseTask(
+                name='where', x=input_like(cond, 'cond'), y=input_like(x, 'x'), op=lambda a, b: if_then_else(a, b, y)
+            ),
+        )
+
+
 class MaxOp(Operator):
     def __init__(self, *tensors: Tensor):
         def scalar_max(args: List[expr.Expr]):
@@ -558,6 +697,32 @@ class MinOp(Operator):
                 op=lambda *args: scalar_min(args),
             ),
         )
+
+
+class SetStridedSliceOp(Operator):
+    def __init__(
+        self,
+        data: Tensor,
+        starts: Sequence[Optional[int]],
+        ends: Sequence[Optional[int]],
+        strides: Optional[Sequence[Optional[int]]] = None,
+        setvalue: Optional[Union[int, float]] = 0.0,
+    ):
+        starts, ends, axes, strides = normalize_slice(data.shape, starts, ends, axes=None, strides=strides)
+        task = SetStridedSliceTask(input_like(data, 'data'), starts, ends, axes, strides, setvalue)
+        super().__init__(
+            inputs=[data],
+            attributes={'starts': starts, 'ends': ends, 'strides': strides, 'setvalue': setvalue},
+            task=task,
+        )
+
+
+class RollOp(Operator):
+    def __init__(self, x: Tensor, shifts: Sequence[int], dims: Sequence[int]):
+        if not len(shifts) == len(dims):
+            raise ValueError('Roll must have same size shifts and dims, got {} and {}'.format(len(shifts), len(dims)))
+        task = RollTask(input_like(x, 'x'), shifts, dims)
+        super().__init__(inputs=[x], attributes={'shifts': shifts, 'dims': dims}, task=task)
 
 
 Scalar = Union[Expr, float, int, complex]
@@ -792,10 +957,25 @@ def sign(x: Tensor) -> Tensor:
     return SignOp(x).outputs[0]
 
 
-def where(cond: Tensor, x: Tensor, y: Tensor) -> Tensor:
+def clamp(x: Tensor, min: Union[Tensor, float, int], max: Union[Tensor, float, int]) -> Tensor:
+    if isinstance(min, Tensor) or isinstance(max, Tensor):
+        raise NotImplementedError('clamp with tensor min/max is not implemented yet')
+    return ClampOp(x, min, max).outputs[0]
+
+
+def where(cond: Tensor, x: Union[Tensor, PyScalar], y: Union[Tensor, PyScalar]) -> Tensor:
     if cond.dtype != dtypes.boolean:
         raise ValueError('The condition tensor must have dtype "bool", but got {}'.format(cond.dtype.name))
-    return WhereOp(cond, x, y).outputs[0]
+    if isinstance(x, Tensor) and isinstance(y, Tensor):
+        return WhereOp(cond, x, y).outputs[0]
+    elif isinstance(x, Tensor) and isinstance(y, (int, float, complex)):
+        return WhereTensorScalarOp(cond, x=x, y=y).outputs[0]
+    elif isinstance(x, (int, float, complex)) and isinstance(y, Tensor):
+        return WhereScalarTensorOp(cond, x=x, y=y).outputs[0]
+    elif isinstance(x, (int, float, complex)) and isinstance(y, (int, float, complex)):
+        return WhereScalarScalarOp(cond, x=x, y=y).outputs[0]
+    else:
+        raise ValueError('Invalid arguments for where: x={}, y={}'.format(x, y))
 
 
 def maximum(a: Tensor, b: Tensor, *others: Tensor) -> Tensor:
@@ -812,7 +992,8 @@ def mod(x: Tensor, y: Tensor) -> Tensor:
     return ModOp(x, y).outputs[0]
 
 
-remainder = mod
+def remainder(x: Tensor, y: Tensor) -> Tensor:
+    return mod(x, y)
 
 
 def abs(x: Tensor) -> Tensor:
@@ -864,6 +1045,20 @@ def logaddexp(x: Tensor, y: Tensor) -> Tensor:
     return log(exp(x - max_val) + exp(y - max_val)) + max_val
 
 
+def roll(x: Tensor, shifts: Union[int, Sequence[int]], dims: Union[int, Sequence[int]] = None) -> Tensor:
+    if isinstance(shifts, int):
+        shifts = [shifts]
+    if isinstance(dims, int):
+        dims = [dims]
+    if dims is None:
+        from .transform import flatten, reshape
+
+        shape = x.shape
+        return reshape(RollOp(flatten(x), shifts, dims=[0]).outputs[0], shape)
+    dims = normalize_dim(dims, len(x.shape))
+    return RollOp(x, shifts, dims).outputs[0]
+
+
 # out = binary_op(left_unary_op(x), right_unary_op(x)); This allows more fusion opportunity.
 def composite_elementwise(
     x: Tensor,
@@ -872,3 +1067,13 @@ def composite_elementwise(
     binary_op: BinaryElementwiseOperation,
 ) -> Tensor:
     return CompositeElementwiseOp(x, left_unary_op, right_unary_op, binary_op).outputs[0]
+
+
+def set_strided_slice(
+    data: Tensor,
+    starts: Sequence[Optional[int]],
+    ends: Sequence[Optional[int]],
+    strides: Optional[Sequence[Optional[int]]] = None,
+    setvalue: Optional[Union[int, float]] = 0.0,
+) -> Tensor:
+    return SetStridedSliceOp(data, starts, ends, strides, setvalue).outputs[0]
