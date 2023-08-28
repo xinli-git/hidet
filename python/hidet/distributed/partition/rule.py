@@ -10,11 +10,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Dict
+from typing import List, Dict, Optional
 from itertools import product, chain
 from functools import lru_cache
 
-from hidet.graph import Operator
+from hidet.graph import Operator, Tensor
 from hidet.ir import TensorElement, Var, Expr
 from hidet.ir.compute import GridCompute, ReduceCompute, ArgReduceCompute, TensorInput
 from hidet.ir.functors import ExprRewriter, ComputeRewriter
@@ -22,6 +22,22 @@ from hidet.ir.analyzers.bound_analyzer import infer_bound, BoundInfo
 
 
 from .shard import TensorShardSpec, OpShardSpec, get_tile, AllReduce, ReduceScatter
+
+
+class ShapeHintTensor:
+    def __init__(self, tensor: Tensor, hints: Dict[str, int]):
+        shape = []
+        for t in tensor.shape:
+            if isinstance(t, int):
+                shape.append(t)
+            elif str(t) in hints:
+                shape.append(hints[str(t)])
+            else:
+                raise NotImplementedError("Symbolic shape {} not found in shape hints, "
+                                          "auto-parallel currently does not support dynamic shapes".format(str(t)))
+
+        self.shape = shape
+        self.tensor = tensor
 
 
 class IndexRewriter(ExprRewriter, ComputeRewriter):
@@ -143,15 +159,11 @@ class DataDependencyAnalyzer:
 
 
 @lru_cache
-def op_shard_rule_search(op: Operator, num_shards: int) -> List[OpShardSpec]:
+def op_shard_rule_search(op: Operator, num_shards: int, symbol_hint: Optional[dict] = None) -> List[OpShardSpec]:
     # Now we only search for 1D partition
-    inputs = op.inputs
-    outputs = op.outputs
+    inputs = [ShapeHintTensor(inp, symbol_hint) for inp in op.inputs]
+    outputs = [ShapeHintTensor(outp, symbol_hint) for outp in op.outputs]
     found_rules = []
-
-    # We do not allow dynamic shapes
-    if len(op.task.symbols) > 0:
-        raise NotImplementedError("Dynamic shapes are not supported now.")
 
     # num_shards == 1 will break following logic
     if num_shards == 1:
@@ -178,9 +190,9 @@ def op_shard_rule_search(op: Operator, num_shards: int) -> List[OpShardSpec]:
                 if shard_dim is not None:
                     if inputs[i].shape[shard_dim] % num_shards != 0:
                         break
-                    new_inputs.append(get_tile(inputs[i], shard_dim, num_shards))
+                    new_inputs.append(get_tile(inputs[i].tensor, shard_dim, num_shards))
                 else:
-                    new_inputs.append(inputs[i])
+                    new_inputs.append(inputs[i].tensor)
             if len(new_inputs) < len(inputs):
                 continue  # Illegal sharding, skip
             outputs = op.reforward(new_inputs)
@@ -191,7 +203,7 @@ def op_shard_rule_search(op: Operator, num_shards: int) -> List[OpShardSpec]:
         # for each output tensor, there should be at most one dimension being sharded
         out_shard_dims = []
         for i, out in enumerate(outputs):
-            origin_shape = list(op.outputs[i].shape)
+            origin_shape = list(outputs[i].shape)
             if list(out.shape) == origin_shape:
                 out_shard_dims.append(None)
                 continue

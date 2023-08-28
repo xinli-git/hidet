@@ -43,14 +43,14 @@ def get_graph_weights(graph: FlowGraph) -> List[Tensor]:
 
 
 def search_strategy(
-    g: FlowGraph, num_shards: int, mem_budget: int, verbose=0, max_seconds=float('inf')
+    g: FlowGraph, num_shards: int, mem_budget: int, verbose=0, max_seconds=float('inf'), shape_hint=None
 ) -> Tuple[Dict[Operator, OpShardSpec], Dict[Tensor, TensorShardSpec]]:
     # Only suport 1D partition
     m = Model()
     m.verbose = verbose
     m.threads = -1  # Use all available CPU cores
     logger.info("Generating rules for each op...")
-    op_rules = {node: op_shard_rule_search(node, num_shards) for node in tqdm.tqdm(g.nodes)}
+    op_rules = {node: op_shard_rule_search(node, num_shards, shape_hint) for node in tqdm.tqdm(g.nodes)}
 
     logger.info("Building ILP...")
     parameters = get_graph_weights(g)
@@ -65,7 +65,7 @@ def search_strategy(
         sharded = xsum(p_vars)
         param_mem += (num_shards - ((num_shards - 1) * sharded)) * (p.nbytes // num_shards)
         param_tot += p.nbytes
-    logger.info(f"Total paramter size: {param_tot/1024**3} GiB")
+    logger.info(f"Total parameter size: {param_tot/1024**3} GiB")
     m += param_mem <= mem_budget
 
     # node communication cost
@@ -127,7 +127,7 @@ def search_strategy(
     status = m.optimize(max_seconds=max_seconds)
     assert status in (OptimizationStatus.OPTIMAL, OptimizationStatus.FEASIBLE), status
     logger.info(f"Minimal cost: {m.objective.x}")
-    logger.info(f"Paramater Size: {param_mem.x / 1024**3} GiB")
+    logger.info(f"Parameter Size: {param_mem.x / 1024**3} GiB")
 
     op_specs = {}
     for node in g.nodes:

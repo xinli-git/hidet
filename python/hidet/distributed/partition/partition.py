@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Dict
+from typing import List, Dict, Optional
 import os
 import pickle
 
@@ -102,7 +102,7 @@ class CommunicationInjection(GraphCloneRewriter):
             return self.memo[tensor]
 
 
-def partition(g: FlowGraph, distributed_config: dict, out_dir: str) -> None:
+def partition(g: FlowGraph, distributed_config: dict, out_dir: str, shape_hint: Optional[Dict[str, int]] = None) -> None:
     n_shards = distributed_config['ngpus']
     mem_budget = distributed_config['mem_budget']
     max_seconds = distributed_config.get('search_max_seconds', float('inf'))
@@ -112,7 +112,7 @@ def partition(g: FlowGraph, distributed_config: dict, out_dir: str) -> None:
     with open(os.path.join(out_dir, "origin_graph.txt"), 'w') as f:
         print(g, file=f)
 
-    op_specs, param_specs = search_strategy(g, n_shards, mem_budget, max_seconds=max_seconds, verbose=solver_verbose)
+    op_specs, param_specs = search_strategy(g, n_shards, mem_budget, max_seconds=max_seconds, verbose=solver_verbose, shape_hint=shape_hint)
     with open(os.path.join(out_dir, "op_param_shard.data"), "wb") as f:
         pickle.dump((op_specs, param_specs), f)
     parts, op_specs, param_specs = _partition(g, n_shards, op_specs, param_specs)
